@@ -484,6 +484,40 @@ async function sbLoadAll(table){
   }catch(e){console.error('[SB] load',table,'error:',e.message);return null;}
 }
 
+// -- CLOUD SETTINGS SYNC ----------------------------------------
+const SYNC_KEYS=['moxies_settings','moxies_sb_url','moxies_sb_key','moxies_sb_bucket',
+  'moxies_r2_base','moxies_r2_worker_url','moxies_r2_token','moxies_alt_storage',
+  'moxies_home_titles','moxies_cats','moxies_admin_pw'];
+
+async function pushSettingsToCloud(sbUrl,sbKey){
+  if(!sbUrl||!sbKey)return false;
+  const data={};
+  SYNC_KEYS.forEach(k=>{const v=localStorage.getItem(k);if(v!=null)data[k]=v;});
+  try{
+    const res=await fetch(`${sbUrl}/rest/v1/app_settings`,{
+      method:'POST',
+      headers:{'apikey':sbKey,'Authorization':'Bearer '+sbKey,'Content-Type':'application/json','Prefer':'resolution=merge-duplicates,return=minimal'},
+      body:JSON.stringify({id:'singleton',data,updated_at:new Date().toISOString()})
+    });
+    return res.ok;
+  }catch(e){console.warn('[SB] Settings push failed:',e);return false;}
+}
+
+async function pullSettingsFromCloud(sbUrl,sbKey){
+  if(!sbUrl||!sbKey)return null;
+  try{
+    const res=await fetch(`${sbUrl}/rest/v1/app_settings?id=eq.singleton&select=data`,{
+      headers:{'apikey':sbKey,'Authorization':'Bearer '+sbKey}
+    });
+    if(!res.ok)return null;
+    const rows=await res.json();
+    const data=rows?.[0]?.data;
+    if(!data||typeof data!=='object')return null;
+    Object.entries(data).forEach(([k,v])=>{if(SYNC_KEYS.includes(k))localStorage.setItem(k,v);});
+    return Object.keys(data).length;
+  }catch(e){console.warn('[SB] Settings pull failed:',e);return null;}
+}
+
 // -- JS ↔ DB field mapping --------------------------------------
 // Supabase uses snake_case columns; JS app uses camelCase fields.
 function menuToSB(item){
@@ -3917,7 +3951,32 @@ function AdminSettingsPanel({showToast}){
   const[saving,setSaving]=useState(false);
   const[openSection,setOpenSection]=useState('provider');
   const[uploadTest,setUploadTest]=useState('');
+  const[syncStatus,setSyncStatus]=useState('');
   const p=k=>v=>setCfg(prev=>({...prev,[k]:v}));
+
+  // Auto-pull from cloud on open if Supabase is configured
+  useEffect(()=>{
+    const url=store.get('moxies_sb_url','').replace(/\/$/,'');
+    const key=store.get('moxies_sb_key','');
+    if(!url||!key)return;
+    setSyncStatus('⏳ Syncing from cloud…');
+    pullSettingsFromCloud(url,key).then(count=>{
+      if(count===null){setSyncStatus('');}
+      else{
+        setCfg(loadSettings());
+        setSbUrl(store.get('moxies_sb_url',''));
+        setSbKey(store.get('moxies_sb_key',''));
+        setSbBucket(store.get('moxies_sb_bucket','videos'));
+        setR2Base(store.get('moxies_r2_base',''));
+        setR2WorkerUrl(store.get('moxies_r2_worker_url',''));
+        setR2Token(store.get('moxies_r2_token',''));
+        setAltUrl(store.get('moxies_alt_storage',''));
+        setHomeTitles(store.get('moxies_home_titles',{highlights:'Menu Highlights',picks:"Chef's Picks",picksCategory:'Mains'}));
+        setSyncStatus('✅ Synced from cloud');
+        setTimeout(()=>setSyncStatus(''),3000);
+      }
+    });
+  },[]);
   const pKey=provider=>v=>setCfg(prev=>({...prev,keys:{...prev.keys,[provider]:v}}));
   const providers=Object.entries(AI_PROVIDERS);
   const seg=(id,active)=>({flex:1,padding:'9px 6px',borderRadius:10,border:'none',cursor:'pointer',fontSize:12,fontWeight:700,fontFamily:"'Lato',sans-serif",transition:'all .2s',background:active?'var(--green)':'rgba(201,168,76,.08)',color:active?'white':'var(--text2)',boxShadow:active?'var(--shadow-btn)':'none'});
@@ -3933,6 +3992,14 @@ function AdminSettingsPanel({showToast}){
     store.set('moxies_sb_key',sbKey.trim());
     store.set('moxies_sb_bucket',sbBucket.trim()||'videos');
     store.set('moxies_home_titles',homeTitles);
+    // Push all settings to cloud
+    const _sbUrl=sbUrl.trim(),_sbKey=sbKey.trim();
+    if(_sbUrl&&_sbKey){
+      pushSettingsToCloud(_sbUrl,_sbKey).then(ok=>{
+        setSyncStatus(ok?'☁️ Saved to cloud':'⚠️ Cloud sync failed — check Supabase setup');
+        setTimeout(()=>setSyncStatus(''),4000);
+      });
+    }
     setTimeout(()=>{
       setSaving(false);
       const provLabel=AI_PROVIDERS[cfg.provider]?.label||cfg.provider;
@@ -4056,11 +4123,36 @@ function AdminSettingsPanel({showToast}){
       sbUrl&&h('div',{style:{fontSize:11,color:'var(--green2)',padding:'6px 10px',background:'rgba(42,90,64,.08)',borderRadius:8,marginBottom:10,lineHeight:1.5,wordBreak:'break-all'}},
         '🔗 Video URL format: ',h('code',{style:{fontSize:10}},sbUrl.trim()+'/storage/v1/object/public/'+sbBucket+'/{filename}')
       ),
-      h('button',{onClick:testSupabase,className:'btn btn-gold btn-sm',style:{marginBottom:8}},'🔌 Test Connection'),
-      uploadTest&&h('div',{style:{fontSize:12,color:'var(--text2)',padding:'6px 10px',background:'rgba(201,168,76,.08)',borderRadius:8,marginBottom:8}},uploadTest),
+      h('div',{style:{display:'flex',gap:8,marginBottom:8,flexWrap:'wrap'}},
+        h('button',{onClick:testSupabase,className:'btn btn-gold btn-sm'},'🔌 Test Connection'),
+        h('button',{onClick:async()=>{
+          const url=sbUrl.trim(),key=sbKey.trim();
+          if(!url||!key){showToast('⚠️ Enter Supabase URL and key first');return;}
+          setSyncStatus('⏳ Syncing from cloud…');
+          const count=await pullSettingsFromCloud(url,key);
+          if(count===null){
+            setSyncStatus('❌ Sync failed — check URL and key');
+            setTimeout(()=>setSyncStatus(''),4000);
+          }else{
+            setCfg(loadSettings());
+            setR2Base(store.get('moxies_r2_base',''));
+            setR2WorkerUrl(store.get('moxies_r2_worker_url',''));
+            setR2Token(store.get('moxies_r2_token',''));
+            setAltUrl(store.get('moxies_alt_storage',''));
+            setSyncStatus('✅ Synced from cloud');
+            showToast('✅ All settings synced from cloud!');
+            setTimeout(()=>setSyncStatus(''),4000);
+          }
+        },className:'btn btn-gold btn-sm'},'☁️ Sync from Cloud')
+      ),
+      uploadTest&&h('div',{style:{fontSize:12,color:'var(--text2)',padding:'6px 10px',background:'rgba(201,168,76,.08)',borderRadius:8,marginBottom:6}},uploadTest),
+      syncStatus&&h('div',{style:{fontSize:12,color:'var(--text2)',padding:'6px 10px',background:'rgba(42,90,64,.08)',borderRadius:8,marginBottom:6,fontWeight:700}},syncStatus),
       h('div',{style:{fontSize:11,color:'var(--text3)',lineHeight:1.5,padding:'8px 10px',background:'rgba(201,168,76,.06)',borderRadius:8}},
         '💡 Get your keys at ',h('a',{href:'https://supabase.com/dashboard',target:'_blank',style:{color:'var(--green2)'}},'supabase.com/dashboard'),
-        ' → Project → Settings → API. Create a Storage bucket named "videos" with public access.'
+        ' → Project → Settings → API. Create a Storage bucket named "videos" with public access.',
+        h('br',null),
+        h('strong',{style:{color:'var(--green2)'}},'New device? '),
+        'Enter URL + Key above → tap "Sync from Cloud" to restore all your settings instantly.'
       )
     ),
 
