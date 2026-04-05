@@ -2967,6 +2967,8 @@ function VideoField({videoUrl,videoFilename,onUrlChange,onFilenameChange}){
   const sbKey=store.get('moxies_sb_key','');
   const sbBucket=store.get('moxies_sb_bucket','videos');
   const r2Base=store.get('moxies_r2_base','').replace(/\/$/,'');
+  const r2WorkerUrl=store.get('moxies_r2_worker_url','').replace(/\/$/,'');
+  const r2Token=store.get('moxies_r2_token','');
   const[uploading,setUploading]=useState(false);
   const[uploadMsg,setUploadMsg]=useState('');
   const ref=useRef();
@@ -2983,10 +2985,10 @@ function VideoField({videoUrl,videoFilename,onUrlChange,onFilenameChange}){
       // No Supabase -- store as local blob
       const data=await readFileAsDataURL(file);
       onUrlChange(data);onFilenameChange('');
-      setUploadMsg('✓ Stored locally (add Supabase in Settings to sync across devices)');
+      setUploadMsg('✓ Stored locally (add R2 or Supabase in Settings to sync across devices)');
       return;
     }
-    setUploading(true);setUploadMsg('Uploading…');
+    setUploading(true);setUploadMsg('Uploading to Supabase…');
     const filename=file.name.toLowerCase().replace(/[^a-z0-9._-]/g,'-');
     try{
       const res=await fetch(`${sbUrl}/storage/v1/object/${sbBucket}/${filename}`,{
@@ -2996,15 +2998,41 @@ function VideoField({videoUrl,videoFilename,onUrlChange,onFilenameChange}){
       });
       const d=await res.json();
       console.log('[Supabase] Upload response:',d);
-      if(d.error){throw new Error(d.error.message||JSON.stringify(d.error));}
+      if(!res.ok||d.error){throw new Error(d.message||d.error||`HTTP ${res.status}`);}
       onFilenameChange(filename);onUrlChange('');
-      setUploadMsg('✓ Uploaded: '+filename);
+      setUploadMsg('✓ Uploaded to Supabase: '+filename);
     }catch(e){
       console.error('[Supabase] Upload failed:',e);
       // Fallback to local blob
       const data=await readFileAsDataURL(file);
       onUrlChange(data);onFilenameChange('');
-      setUploadMsg('⚠️ Supabase upload failed ('+e.message+') -- stored locally');
+      setUploadMsg('⚠️ Supabase upload failed ('+e.message+') — stored locally');
+    }
+    setUploading(false);
+  }
+
+  async function uploadToR2(file){
+    if(!r2WorkerUrl){
+      // No R2 Worker configured — fall back to Supabase
+      return uploadToSupabase(file);
+    }
+    setUploading(true);setUploadMsg('Uploading to R2…');
+    const filename=file.name.toLowerCase().replace(/[^a-z0-9._-]/g,'-');
+    try{
+      const res=await fetch(`${r2WorkerUrl}/${filename}`,{
+        method:'PUT',
+        headers:{'Content-Type':file.type,'X-Upload-Token':r2Token||''},
+        body:file,
+      });
+      if(!res.ok){const t=await res.text();throw new Error(`HTTP ${res.status}: ${t.substring(0,120)}`);}
+      const d=await res.json();
+      console.log('[R2] Upload response:',d);
+      onFilenameChange(filename);onUrlChange('');
+      setUploadMsg('✓ Uploaded to R2: '+filename);
+    }catch(e){
+      console.error('[R2] Upload failed:',e);
+      setUploadMsg('⚠️ R2 upload failed ('+e.message+') — trying Supabase…');
+      return uploadToSupabase(file);
     }
     setUploading(false);
   }
@@ -3027,12 +3055,12 @@ function VideoField({videoUrl,videoFilename,onUrlChange,onFilenameChange}){
                 )
               :h('div',{style:{display:'flex',alignItems:'center',gap:8,justifyContent:'center',color:'var(--text3)'}},
                   h('div',{style:{width:20,height:20}},I.video),
-                  h('span',{style:{fontSize:13}},sbUrl?'Upload MP4 → auto-saves to Supabase':'Upload MP4 from phone')
+                  h('span',{style:{fontSize:13}},r2WorkerUrl?'Upload MP4 → saves to R2':sbUrl?'Upload MP4 → saves to Supabase':'Upload MP4 from phone')
                 )
       ),
       h('input',{ref,type:'file',accept:'video/mp4,video/*',onChange:async e=>{
         const f=e.target.files[0];if(!f)return;
-        await uploadToSupabase(f);
+        await uploadToR2(f);
       }})
     ),
     // Manual filename entry
@@ -3046,7 +3074,7 @@ function VideoField({videoUrl,videoFilename,onUrlChange,onFilenameChange}){
     uploadMsg&&h('div',{style:{fontSize:11,color:'var(--text2)',padding:'4px 8px',background:'rgba(201,168,76,.08)',borderRadius:6,marginBottom:4}},uploadMsg),
     resolvedUrl&&h(MediaPreview,{src:resolvedUrl,type:'video',label:'🎬 Video Preview'}),
     h('div',{style:{fontSize:10,color:'var(--text3)',marginTop:4,lineHeight:1.5}},
-      sbUrl?'📤 Files auto-upload to Supabase Storage on select.':'💡 Add Supabase in Settings to enable cloud storage.'
+      r2WorkerUrl?'📤 Files upload to Cloudflare R2 on select.':sbUrl?'📤 Files auto-upload to Supabase Storage on select.':'💡 Add R2 Worker or Supabase in Settings to enable cloud storage.'
     )
   );
 }
@@ -3172,6 +3200,15 @@ function AdminMenu({menu,setMenu,showToast}){
         ),
         h('input',{id:'img-upload-menu',type:'file',accept:'image/*',onChange:async e=>{
           const fl=e.target.files[0];if(!fl)return;
+          const wUrl=store.get('moxies_r2_worker_url','').replace(/\/$/,'');
+          const wTok=store.get('moxies_r2_token','');
+          if(wUrl){
+            try{
+              const fname='img-'+fl.name.toLowerCase().replace(/[^a-z0-9._-]/g,'-');
+              const res=await fetch(`${wUrl}/${fname}`,{method:'PUT',headers:{'Content-Type':fl.type,'X-Upload-Token':wTok||''},body:fl});
+              if(res.ok){const d=await res.json();f('imgUrl',d.url||(store.get('moxies_r2_base','').replace(/\/$/,'')+'/'+fname));return;}
+            }catch(err){console.error('[R2] Image upload failed:',err);}
+          }
           const d=await readFileAsDataURL(fl);f('imgUrl',d);
         }}),
         form.imgUrl&&h(MediaPreview,{src:form.imgUrl,type:'image',label:'🖼 Photo Preview'})
@@ -3869,6 +3906,8 @@ function AdminFAQ({faq,setFaq,showToast}){
 function AdminSettingsPanel({showToast}){
   const[cfg,setCfg]=useState(()=>loadSettings());
   const[r2Base,setR2Base]=useState(()=>store.get('moxies_r2_base',''));
+  const[r2WorkerUrl,setR2WorkerUrl]=useState(()=>store.get('moxies_r2_worker_url',''));
+  const[r2Token,setR2Token]=useState(()=>store.get('moxies_r2_token',''));
   const[altUrl,setAltUrl]=useState(()=>store.get('moxies_alt_storage',''));
   const[sbUrl,setSbUrl]=useState(()=>store.get('moxies_sb_url',''));
   const[sbKey,setSbKey]=useState(()=>store.get('moxies_sb_key',''));
@@ -3887,6 +3926,8 @@ function AdminSettingsPanel({showToast}){
     setSaving(true);
     store.set('moxies_settings',cfg);
     store.set('moxies_r2_base',r2Base.trim());
+    store.set('moxies_r2_worker_url',r2WorkerUrl.trim());
+    store.set('moxies_r2_token',r2Token.trim());
     store.set('moxies_alt_storage',altUrl.trim());
     store.set('moxies_sb_url',sbUrl.trim());
     store.set('moxies_sb_key',sbKey.trim());
@@ -4023,20 +4064,41 @@ function AdminSettingsPanel({showToast}){
       )
     ),
 
-    // -- 5. Cloudflare R2 (alternative) --
-    h(Accord,{id:'storage',emoji:'☁️',label:'Cloudflare R2 (Alternative)'},
+    // -- 5. Cloudflare R2 --
+    h(Accord,{id:'storage',emoji:'☁️',label:'Cloudflare R2 Storage'},
       h('div',{style:{fontSize:13,color:'var(--text2)',lineHeight:1.6,marginBottom:14}},
-        'Use Cloudflare R2 instead of Supabase (zero egress fees). If both are set, Supabase takes priority.'
+        'Upload videos & images directly to Cloudflare R2 (zero egress fees). Requires a Cloudflare Worker — see the setup guide for one-time deployment instructions.'
       ),
-      h('div',{style:{marginBottom:14}},
-        h('label',{className:'label'},'R2 Bucket Base URL'),
+      h('div',{style:{marginBottom:10}},
+        h('label',{className:'label'},'R2 Upload Worker URL'),
+        h('input',{value:r2WorkerUrl,onChange:e=>setR2WorkerUrl(e.target.value),placeholder:'https://moxies-upload.yourname.workers.dev',className:'field',style:{marginBottom:4}}),
+        r2WorkerUrl
+          ? h('div',{style:{fontSize:11,color:'var(--green2)',padding:'6px 10px',background:'rgba(42,90,64,.08)',borderRadius:8}},
+              '✓ Uploads will go to: ',h('code',{style:{fontSize:10,wordBreak:'break-all'}},r2WorkerUrl.replace(/\/$/,'')+'/filename.mp4')
+            )
+          : h('div',{style:{fontSize:11,color:'var(--text3)',marginTop:2}},
+              '📖 Deploy the Cloudflare Worker, then paste its URL here. Without this, uploads fall back to Supabase.'
+            )
+      ),
+      h('div',{style:{marginBottom:12}},
+        h('label',{className:'label'},'R2 Upload Token'),
+        h('div',{style:{display:'flex',gap:8}},
+          h('input',{type:revealed.r2Token?'text':'password',value:r2Token,onChange:e=>setR2Token(e.target.value),placeholder:'your-secret-upload-token',className:'field',style:{flex:1}}),
+          h('button',{onClick:()=>setRevealed(r=>({...r,r2Token:!r.r2Token})),style:{background:'transparent',border:'none',cursor:'pointer',fontSize:14,color:'var(--text3)',flexShrink:0}},revealed.r2Token?'🙈':'👁')
+        ),
+        h('div',{style:{fontSize:11,color:'var(--text3)',marginTop:4}},
+          '🔒 Must match the UPLOAD_TOKEN environment variable set in your Cloudflare Worker.'
+        )
+      ),
+      h('div',{style:{marginBottom:12}},
+        h('label',{className:'label'},'R2 Public Base URL ',h('span',{style:{fontWeight:400,color:'var(--text3)'}},'(for playback)')),
         h('input',{value:r2Base,onChange:e=>setR2Base(e.target.value),placeholder:'https://pub-abc123.r2.dev/',className:'field',style:{marginBottom:6}}),
         r2Base
           ? h('div',{style:{fontSize:11,color:'var(--green2)',padding:'6px 10px',background:'rgba(42,90,64,.08)',borderRadius:8,lineHeight:1.5}},
-              '✓ Full URL: ',h('code',{style:{fontSize:10,wordBreak:'break-all'}},r2Base.replace(/\/$/,'')+'/your-video.mp4')
+              '✓ Videos play from: ',h('code',{style:{fontSize:10,wordBreak:'break-all'}},r2Base.replace(/\/$/,'')+'/your-video.mp4')
             )
           : h('div',{style:{fontSize:11,color:'var(--text3)'}},
-              '📖 Cloudflare → R2 → bucket → Settings → enable Public Access → copy Domain'
+              '📖 Cloudflare → R2 → your bucket → Settings → enable Public Access → copy Domain'
             )
       ),
       h('div',{style:{marginBottom:14}},
